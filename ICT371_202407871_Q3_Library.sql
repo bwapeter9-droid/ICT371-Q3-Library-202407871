@@ -204,27 +204,40 @@ BEGIN
 END;
 $$;
 
-CREATE EXTENSION IF NOT EXISTS pg_cron;
 
-SELECT cron.schedule('q3_refresh_overdue', '10 0 * * *',
-                     $$CALL q3_library.pr_refresh_overdue(CURRENT_DATE)$$);
+-- Safe scheduling: runs only if pg_cron is available on this server.
+-- If it is not installed you will just see a NOTICE and the rest of the script still works.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_cron') THEN
+        CREATE EXTENSION IF NOT EXISTS pg_cron;
+        PERFORM cron.schedule('q3_refresh_overdue', '10 0 * * *', $cmd$CALL q3_library.pr_refresh_overdue(CURRENT_DATE)$cmd$);
+        RAISE NOTICE 'Job q3_refresh_overdue scheduled: 10 0 * * *';
+    ELSE
+        RAISE NOTICE 'pg_cron is not installed on this server - job NOT scheduled. Schedule used: 10 0 * * *';
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Could not schedule job (q3_refresh_overdue): %', SQLERRM;
+END
+$do$;
 
-SELECT jobid, jobname, schedule, command, active FROM cron.job WHERE jobname = 'q3_refresh_overdue';
+-- Inspect job / history (uncomment where pg_cron is installed):
+-- SELECT jobid, jobname, schedule, command, active FROM cron.job WHERE jobname = 'q3_refresh_overdue';
 -- SELECT * FROM cron.job_run_details ORDER BY start_time DESC LIMIT 10;
 
 -- =====================================================================
 -- TESTS / EVIDENCE
 -- =====================================================================
-\echo '--- (a) Data ---'
+SELECT '--- (a) Data ---' AS section;
 SELECT * FROM loans ORDER BY loan_id;
 
-\echo '--- (b) Function ---'
+SELECT '--- (b) Function ---' AS section;
 SELECT loan_id, fn_loan_fine(loan_id, CURRENT_DATE) AS fine_today FROM loans ORDER BY loan_id;  -- 12, 0, 12, 0, 0, 6
 SELECT fn_loan_fine(3, CURRENT_DATE + 100) AS returned_loan_stops_accumulating;                  -- still 12
 DO $$ BEGIN PERFORM fn_loan_fine(999, CURRENT_DATE);
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (unknown loan): %', SQLERRM; END $$;
 
-\echo '--- (c) Procedure: rejected cases ---'
+SELECT '--- (c) Procedure: rejected cases ---' AS section;
 DO $$ BEGIN CALL pr_return_loan(999, CURRENT_DATE);
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (unknown): %', SQLERRM; END $$;
 DO $$ BEGIN CALL pr_return_loan(3, CURRENT_DATE);
@@ -233,21 +246,21 @@ DO $$ BEGIN CALL pr_return_loan(1, CURRENT_DATE - 100);
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (before borrowed_on): %', SQLERRM; END $$;
 SELECT loan_id, returned_on, fine_amount FROM loans ORDER BY loan_id;
 
-\echo '--- (d) Trigger: 3 audit rows; no row when the date is unchanged ---'
+SELECT '--- (d) Trigger: 3 audit rows; no row when the date is unchanged ---' AS section;
 SELECT * FROM loan_audit ORDER BY audit_id;
 UPDATE loans SET returned_on = returned_on WHERE loan_id = 3;   -- same value -> no audit
 UPDATE loans SET borrower_name = 'Chanda M. Mwila' WHERE loan_id = 3;
 SELECT COUNT(*) AS audit_rows_still_3 FROM loan_audit;
 
-\echo '--- (e) View ---'
+SELECT '--- (e) View ---' AS section;
 SELECT * FROM v_overdue_loans ORDER BY loan_id;                 -- loans 1 and 6
 
-\echo '--- (f) EXPLAIN ---'
+SELECT '--- (f) EXPLAIN ---' AS section;
 SET enable_seqscan = off;
 EXPLAIN SELECT * FROM loans WHERE book_id = 1 AND returned_on IS NULL;
 RESET enable_seqscan;
 
-\echo '--- (g) Run twice: same snapshot_date is replaced ---'
+SELECT '--- (g) Run twice: same snapshot_date is replaced ---' AS section;
 CALL pr_refresh_overdue(CURRENT_DATE);
 SELECT * FROM overdue_summary;                                  -- count 2, fine 18
 CALL pr_refresh_overdue(CURRENT_DATE);
